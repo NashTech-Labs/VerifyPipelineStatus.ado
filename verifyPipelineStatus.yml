@@ -1,0 +1,419 @@
+parameters:
+- name: maxIteration
+  type: string
+
+- name: stagesToVerify
+  type: string
+
+- name: buildSpec
+  type: string
+
+- name: failOnPipelineFailure
+  type: string
+
+- name: verifyStepName
+  type: string
+
+- name: stepDisplayName
+  type: string
+  
+- name: executeCondition
+  type: string
+
+steps:
+- pwsh: |
+    function Get-StateDescription {
+      [CmdletBinding()]
+      param (
+        [Parameter()]
+        $State
+      )
+
+      switch ($State) {
+        { $_ -eq '0' -or $_ -eq 'notStarted' -or $_ -eq 'postponed' } { "Waiting/Queued"; break }
+        { $_ -eq '1' -or $_ -eq 'cancelling' -or $_ -eq 'inProgress' } { "Running"; break }
+        { $_ -eq '2' -or $_ -eq 'completed' } { "Completed"; break }
+        default { "N/A" }
+      }
+    }
+
+    function Get-ResultDescription {
+      [CmdletBinding()]
+      param (
+        [Parameter()]
+        $Result
+      )
+
+      switch ($Result) {
+        { $_ -eq '0' -or $_ -eq 'succeeded' } { "Success"; break }
+        { $_ -eq '1' } { "Warning"; break }
+        { $_ -eq '2' -or $_ -eq 'failed' -or $_ -eq 'partiallySucceeded' } { "Failed"; break }
+        { $_ -eq '3' -or $_ -eq 'canceled' } { "Canceled"; break }
+        { $_ -eq '4' } { "Skipped"; break }
+        default { "N/A" }
+      }
+    }
+    
+    try {
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+      $maxIteration =[int]"$(ado.pipelineStatusCheckMaxIteration)"
+      # $maxIteration = [int]'${{ parameters.maxIteration }}'
+      if (-not [string]::IsNullOrWhiteSpace('${{ parameters.maxIteration }}')) {
+        $maxIteration = [int]'${{ parameters.maxIteration }}'
+      }
+
+      $buildSpec = '${{ parameters.buildSpec }}' | ConvertFrom-Json -Depth 10
+      $buildSpec | % {
+        if (-not ($_ | gm -Name 'stagesToVerify' -MemberType 'NoteProperty')) {
+          if ([string]::IsNullOrWhiteSpace('${{ parameters.stagesToVerify }}')) {
+            $_ | Add-Member -NotePropertyName 'stagesToVerify' -NotePropertyValue $null
+          }
+          else {
+            $_ | Add-Member -NotePropertyName 'stagesToVerify' -NotePropertyValue '${{ parameters.stagesToVerify }}'
+          }
+        }
+      }
+
+      $buildInfo = @{}
+      $buildSpec | % {
+        if ($_.stagesToVerify) {
+          $buildInfo.Add($_.buildId, @($_.stagesToVerify -split ',\s*'))
+        }
+        else {
+          $buildInfo.Add($_.buildId, $null)
+        }
+      }
+
+      echo "Build information to check status for:"
+      $buildInfo.Keys | % {
+        echo "BuildId: $_, Stages: $($($buildInfo[$_]) -join ', ')"
+      }
+
+      $base64EncodedAccessToken = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f "", $env:ADOAccessToken)))
+      $contentType = "application/json"
+      $headers = @{ 
+        Authorization = ("Basic {0}" -f $base64EncodedAccessToken)
+      }
+
+      $iterationCount = 1
+      $continueExecution = $true
+      $failedBuilds = @{}
+      $incompleteBuilds = @{}
+      $buildSummary = @()
+      $buildInfo.Keys | % {
+        if ($buildInfo[$_]) {
+          $buildSummary += [PSCustomObject]@{
+            pipelineId = $null
+            pipelineName = $null
+            buildId = $_
+            buildNumber = $null
+            stages = $buildInfo[$_] | % { 
+              [PSCustomObject]@{
+                name = $_
+                state = $null
+                result = $null
+              } 
+            }
+          }
+        }
+        else {
+          $buildSummary += [PSCustomObject]@{
+            pipelineId = $null
+            pipelineName = $null
+            buildId = $_
+            buildNumber = $null
+            state = $null
+            result= $null
+          }
+        }
+      }
+
+      while ($iterationCount -le $maxIteration -and $continueExecution -eq $true) {
+        echo "Iteration $iterationCount of $maxIteration"
+        $tempBuildInfo = @{}
+        $incompleteBuilds = @{}
+        $buildInfo.Keys | % {
+          $buildId = $_
+          echo "Checking status for build id: $buildId"
+
+          $stageVerification = $false
+          #Build status check with specific stages
+          if ($buildInfo[$buildId]) {
+            $stageVerification = $true
+            $url = "$(ado.pipelineStageResultURL)".Replace("{buildId}", $buildId)
+            echo "Url to invoke: $url"
+          }
+          #Build status check without any specified stages
+          else {
+            $stageVerification = $false
+            $url = "$(ado.pipelineResultURL)".Replace("{buildId}", $buildId)
+            echo "Url to invoke: $url"
+          }
+
+          try {
+            #Invoke api to get the pipeline run result
+            $response = irm -Uri $url -Method Get -ContentType $contentType -Headers $headers
+          }
+          catch {
+            #Handle exception for retry
+            $response = $null
+          }
+
+          #For stage verification
+          if ($stageVerification) {
+            if ($response) {
+              if ($response.fps.dataProviders.exceptions) { 
+                $exceptionType = $response.fps.dataProviders.exceptions.'ms.vss-build-web.run-details-data-provider'.exceptionType
+                $exceptionMessage = $response.fps.dataProviders.exceptions.'ms.vss-build-web.run-details-data-provider'.message
+                echo "##vso[task.logissue type=error]ExceptionType: '$exceptionType', ExceptionMessage: '$exceptionMessage'"
+                $failTask = $true
+              }
+              else {
+                $pipelineId = [string]$response.fps.dataProviders.data.'ms.vss-build-web.run-details-data-provider'.pipeline.id
+                $pipelineName = $response.fps.dataProviders.data.'ms.vss-build-web.run-details-data-provider'.pipeline.name
+                $buildNumber = $response.fps.dataProviders.data.'ms.vss-build-web.run-details-data-provider'.number
+
+                $buildInstance = $buildSummary | ? { $_.buildId -eq $buildId }
+                $buildInstance.pipelineId = $pipelineId
+                $buildInstance.pipelineName = $pipelineName
+                $buildInstance.buildNumber = $buildNumber
+
+                $buildInfo[$buildId] | % {
+                  $stageName = $_
+                  echo "Checking status for stage: $stageName"
+                  $stageResponse = $response.fps.dataProviders.data.'ms.vss-build-web.run-details-data-provider'.stages | ? { $_.refName -eq $stageName }
+                  if ($stageResponse) {
+                    $stageState = Get-StateDescription -State $($stageResponse.state)
+                    $stageResult = Get-ResultDescription -Result $($stageResponse.result)
+
+                    $stageInstance = ($buildInstance.stages | ? { $_.name -eq $stageName })
+                    $stageInstance.state = $stageState
+                    $stageInstance.result = $stageResult  
+
+                    echo "##[command]Build Name: '$($pipelineName)', Build Id: '$buildId', Stage Name: '$($stageResponse.refName)', Stage State: '$stageState', Stage Result: '$stageResult'"
+
+                    #Stage Completed
+                    if($stageResponse.state -eq 2) {
+                      #Stage Successful
+                      if ($stageResponse.result -eq 0) {
+                        echo "##[section]Build Name: '$($pipelineName)' for Build Id: '$buildId' is completed with Result: '$stageResult' for Stage: '$($stageResponse.refName)'"
+                      }
+                      #Capture completed but not successful build information
+                      else {
+                        echo "##vso[task.logissue type=error]Build Name: '$($pipelineName)' for Build Id: '$buildId' is completed with Result: '$stageResult' for Stage: '$($stageResponse.refName)'"
+                        $failTask = $true
+
+                        $failedBuildInfo = @{
+                          "PipelineId" = $pipelineId
+                          "BuildName" = $($pipelineName)
+                          "StageName" = $($stageResponse.refName)
+                          "State" = $stageState
+                          "Result" = $stageResult
+                        }
+          
+                        if ($failedBuilds.ContainsKey($buildId)) {
+                          $failedBuilds[$buildId] += $failedBuildInfo
+                        }
+                        else {
+                          $failedBuilds.Add($buildId, @($failedBuildInfo))
+                        }
+                      }
+                    }
+                    else {
+                      #Add stageName for incomplete build for re-processing
+                      if ($tempBuildInfo.ContainsKey($buildId)) {
+                        $tempBuildInfo[$buildId] += $stageName
+                      }
+                      else {
+                        $tempBuildInfo.Add($buildId, @($stageName))
+                      }
+                    
+                      $incompleteBuildInfo = @{
+                        "PipelineId" = $pipelineId
+                        "BuildName" = $($pipelineName)
+                        "StageName" = $($stageResponse.refName)
+                        "State" = $stageState
+                        "Result" = $stageResult
+                      }
+          
+                      if ($incompleteBuilds.ContainsKey($buildId)) {
+                        $incompleteBuilds[$buildId] += $incompleteBuildInfo
+                      }
+                      else {
+                        $incompleteBuilds.Add($buildId, @($incompleteBuildInfo))
+                      }
+                    }
+                  }
+                  else {
+                    echo "Could not find a stage with Stage Name: $stageName for BuildId: $buildId."
+                  }
+                }
+              }
+            }
+            else {
+              $buildInfo[$buildId] | % {
+                #Add stageName for incomplete build for re-processing
+                if ($tempBuildInfo.ContainsKey($buildId)) {
+                  $tempBuildInfo[$buildId] += $_
+                }
+                else {
+                  $tempBuildInfo.Add($buildId, @($_))
+                }
+              }
+            }
+          }
+          #Without stage verification
+          else {
+            if ($response) {
+              #Check if buildId is valid
+              if ($response.typeKey -eq 'BuildNotFoundException') {
+                echo "##vso[task.logissue type=error]$($response.message)"
+                $failTask = $true
+              }
+              else {
+                $pipelineId = [string]$response.definition.id
+                $pipelineName = $response.definition.name
+                $buildNumber = $response.buildNumber
+                $buildState = Get-StateDescription -State $($response.status)
+                $builResult = Get-ResultDescription -Result $($response.result)
+
+                $buildInstance = $buildSummary | ? { $_.buildId -eq $buildId }
+                $buildInstance.pipelineId = $pipelineId
+                $buildInstance.pipelineName = $pipelineName
+                $buildInstance.buildNumber = $buildNumber
+                $buildInstance.state = $buildState
+                $buildInstance.result = $builResult
+                
+                echo "##[command]Build Name: '$($pipelineName)', Build Id: '$buildId', Build State: '$($buildState)', Build Result: '$($builResult)'"
+
+                #Build Completed
+                if ($response.status -eq 'completed') {
+                  #Build succeeded
+                  if ($response.result -eq 'succeeded') {
+                    echo "##[section]Build Name: '$($pipelineName)' for Build Id: '$buildId' is completed with Result: '$($builResult)'"
+                  }
+                  #Capture completed but not successful build information
+                  else {
+                    echo "##vso[task.logissue type=error]Build Name: '$($pipelineName)' for Build Id: '$buildId' is completed with Result: '$($builResult)'"
+                    $failTask = $true
+
+                    $failedBuildInfo = @{
+                      "PipelineId" = $pipelineId
+                      "BuildName" = $pipelineName
+                      "State" = $buildState
+                      "Result" = $builResult
+                    }
+        
+                    $failedBuilds.Add($buildId, @($failedBuildInfo))
+                  }
+                } 
+                #Build InProgress
+                else {
+                  #Add incomplete build for re-processing
+                  $tempBuildInfo.Add($buildId, $null)
+                  
+                  $incompleteBuildInfo = @{
+                    "PipelineId" = $pipelineId
+                    "BuildName" = $pipelineName
+                    "State" = $buildState
+                    "Result" = $builResult
+                  }
+        
+                  $incompleteBuilds.Add($buildId, @($incompleteBuildInfo))
+                }
+              }
+            }
+            else {
+              $buildInfo[$buildId] | % {
+                #Add incomplete build for re-processing
+                $tempBuildInfo.Add($buildId, $null)
+              }
+            }
+          }
+        }
+
+        if($tempBuildInfo.Keys.Count -gt 0) {
+          $continueExecution = $true
+          $buildInfo = $tempBuildInfo
+
+          if($iterationCount -ne $maxIteration) {
+            echo "Starting sleep period for $(ado.pipelineStatusCheckInterval) seconds"
+            echo "----------------------------------------------------------------------------------------------------"
+            Start-Sleep $(ado.pipelineStatusCheckInterval)
+          }
+        }
+        else {
+          $continueExecution = $false
+        }
+
+        $iterationCount++
+      }
+
+      echo "----------------------------------------------------------------------------------------------------"
+      if ($failedBuilds.Keys.Count -gt 0 -or $incompleteBuilds.Keys.Count -gt 0) {
+        echo "----------------------------------------------------------------------------------------------------"
+        echo "Failed/Incomplete Build Summary:"
+        echo "----------------------------------------------------------------------------------------------------"
+
+        if ($failedBuilds.Keys.Count -gt 0) {
+          echo "Following builds have been completed but not successful:"
+          $failedBuilds.Keys | % {
+            $buildId = $_
+            $failedBuilds[$buildId] | % {
+              if ($_['StageName']) {
+                echo "##vso[task.logissue type=error]Build failed for BuildName: $($_['BuildName']), BuildId: $buildId, StageName: $($_['StageName']), State: $($_['State']), Result: $($_['Result'])"
+              }
+              else {
+                echo "##vso[task.logissue type=error]Build failed for BuildName: $($_['BuildName']), BuildId: $buildId, State: $($_['State']), Result: $($_['Result'])"
+              }
+            }
+          }
+
+          $failTask = $true
+        }
+
+        if ($incompleteBuilds.Keys.Count -gt 0) {
+          echo "Following builds have not been completed within specified $maxIteration iteration:"
+          $incompleteBuilds.Keys | % {
+            $buildId = $_
+            $incompleteBuilds[$buildId] | % {
+              if ($_['StageName']) {
+                echo "##vso[task.logissue type=warning]Build incomplete for BuildName: $($_['BuildName']), BuildId: $buildId, StageName: $($_['StageName']), State: $($_['State']), Result: $($_['Result'])."
+              }
+              else {
+                echo "##vso[task.logissue type=warning]Build incomplete for BuildName: $($_['BuildName']), BuildId: $buildId, State: $($_['State']), Result: $($_['Result'])"
+              }
+            }
+          }
+        }
+      }
+
+      $compressedBuildSummary = $buildSummary | ConvertTo-Json -Depth 10 -Compress
+      echo "Complete Build Summary: $compressedBuildSummary"
+      #Put build summary in output
+      echo "##vso[task.setvariable variable=BuildSummary;isOutput=true]$compressedBuildSummary"
+      
+      if ($failTask -eq $true) {
+        if ('${{ parameters.failOnPipelineFailure }}' -eq $false) {
+          echo "##vso[task.complete result=SucceededWithIssues;]Pipeline Succeeded With Issues"
+        }
+        else {
+          echo "##vso[task.setvariable variable=CompletionStatus;isOutput=true]Failed"
+          echo "##vso[task.complete result=Failed;]Pipeline Failed"
+        }
+      }
+      else {
+        echo "##vso[task.setvariable variable=CompletionStatus;isOutput=true]Success"
+      }
+    }
+    catch {
+      throw $_
+    }
+  name: ${{ coalesce(parameters.verifyStepName, 'VerifyPipelineStatus') }}
+  displayName: ${{ coalesce(parameters.stepDisplayName, 'Verify Pipeline Status') }}
+  ${{ if parameters.executeCondition }}:
+    condition: ${{ parameters.executeCondition }}
+  failOnStderr: true
+  env:
+    ADOAccessToken: $(ado.pat)
