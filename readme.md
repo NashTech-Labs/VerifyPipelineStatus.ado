@@ -1,4 +1,4 @@
-# ADO.Pipelines.Templates.frameWork.common.pipelineStatus
+# pipelineStatus
 
 ## Pipeline Requirements
 
@@ -39,7 +39,7 @@ You can use the "output variable" of this template as per the requirement. for e
     repositories:
     - repository: Template
         type: github
-        name: your_username/ADO.Pipelines.Templates
+        name:  your_username/Repo_name
         ref: <respective branch name>
         endpoint: 'githubServiceConnectioNname'
 
