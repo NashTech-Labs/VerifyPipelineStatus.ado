@@ -48,7 +48,7 @@ You can use the "output variable" of this template as per the requirement. for e
     - template: templates/verifyPipelineStatus.yml@Template
         parameters:
         BuildId: $buildId
-        verifyStepName: VerifyClaimsPublishPipelines
+        verifyStepName: ${{ parameters.verifyStepName }}
         buildSpec: |
         [
             {
